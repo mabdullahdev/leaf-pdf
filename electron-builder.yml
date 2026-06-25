@@ -28,3 +28,5 @@ linux:
   target:
     - AppImage
   category: Office
+publish:
+  provider: github
