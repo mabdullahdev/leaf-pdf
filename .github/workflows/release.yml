@@ -18,15 +18,17 @@ jobs:
           - os: windows-latest
             name: Windows (x64)
             build_args: --win --x64
+          # Apple Silicon runner cross-builds BOTH Mac DMGs (arm64 + Intel x64).
+          # We avoid the macos-13 Intel runner — GitHub is retiring it and its
+          # queue is unreliable (hangs for hours). electron-builder packages
+          # Electron's prebuilt x64 binaries, so no Intel hardware is needed.
           - os: macos-latest
-            name: macOS (Apple Silicon)
-            build_args: --mac --arm64
-          - os: macos-13
-            name: macOS (Intel)
-            build_args: --mac --x64
+            name: macOS (Apple Silicon + Intel)
+            build_args: --mac --arm64 --x64
 
     name: ${{ matrix.name }}
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
