@@ -5,7 +5,11 @@ on:
 
 jobs:
   ping:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest, macos-13]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
-      - run: echo "runner assigned ok"
+      - run: echo "runner assigned ok on ${{ matrix.os }}"
