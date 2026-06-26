@@ -28,7 +28,7 @@ export type NoteAnnotation = {
   createdAt: number
 }
 
-export type ShapeKind = 'rectangle' | 'oval' | 'line' | 'ink' | 'marker'
+export type ShapeKind = 'rectangle' | 'oval' | 'line' | 'ink' | 'marker' | 'redact'
 
 export type ShapeAnnotation = {
   id: string
@@ -306,6 +306,46 @@ export const DEFAULT_PAGE_NUMBER: PageNumberSettings = {
   margin: 24
 }
 
+/** Kinds of fillable PDF form fields surfaced in the Form tab. */
+export type FormFieldKind = 'text' | 'checkbox' | 'radio' | 'dropdown' | 'listbox'
+
+export type FormFieldAnnotation = {
+  id: string
+  kind: 'form-field'
+  pageNumber: number
+  /** Top-left in PDF user space. */
+  x: number
+  y: number
+  width: number
+  height: number
+  fieldType: FormFieldKind
+  /** Unique field name within the document. AcroForm uses this as the
+   *  internal /T name; for radio buttons sharing a name forms a group. */
+  name: string
+  /** Initial value. For checkbox: '' (unchecked) or 'on'. For radio: the
+   *  option that should be selected. For dropdown/listbox: one of the
+   *  options. For text: free-form. */
+  value: string
+  /** Options for dropdown / listbox / radio. */
+  options?: string[]
+  required: boolean
+  readonly: boolean
+  /** For radio buttons: which option this individual widget represents.
+   *  All radios with the same `name` form a group; the one whose
+   *  `optionValue === value` shows as checked. */
+  optionValue?: string
+  createdAt: number
+}
+
+/** Default footprints in PDF user-space units per field kind. */
+export const FORM_FIELD_DEFAULTS: Record<FormFieldKind, { width: number; height: number }> = {
+  text: { width: 160, height: 22 },
+  checkbox: { width: 16, height: 16 },
+  radio: { width: 16, height: 16 },
+  dropdown: { width: 160, height: 22 },
+  listbox: { width: 160, height: 80 }
+}
+
 /** Per-paragraph editable region detected on a page in Edit mode. Persisted
  *  in the store for the lifetime of the document so the save pipeline can
  *  rebuild the visible text. Not an annotation — never appears in `byPage`. */
@@ -388,6 +428,7 @@ export type Annotation =
   | ImageAnnotation
   | AttachedImageAnnotation
   | LinkAnnotation
+  | FormFieldAnnotation
 
 export const ANNOTATION_COLORS = [
   { name: 'yellow', hex: '#fde047' },

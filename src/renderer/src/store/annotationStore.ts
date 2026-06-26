@@ -8,6 +8,8 @@ import {
   type AttachedImageAnnotation,
   type EditableTextRegion,
   type FontFamily,
+  type FormFieldAnnotation,
+  type FormFieldKind,
   type FreeTextAnnotation,
   type HeaderFooterSettings,
   type ImageAnnotation,
@@ -69,6 +71,16 @@ export type Tool =
   | 'marker'
   | 'link'
   | 'edit-content'
+  | 'form-text'
+  | 'form-checkbox'
+  | 'form-radio'
+  | 'form-dropdown'
+  | 'form-listbox'
+  | 'crop'
+  | 'redact'
+
+/** Per-page crop rects set via the Crop tool. Applied at save time. */
+export type CropRect = { x: number; y: number; width: number; height: number }
 
 /** Per-tool default stroke widths in PDF user-space units. */
 export const INK_DEFAULT_STROKE = 2
@@ -131,6 +143,11 @@ type AnnotationState = {
   editableRegions: Record<number, EditableTextRegion[]>
   /** Override map keyed by region id → new text (when different from original). */
   editedRegions: Record<string, string>
+  /** When true, Form fields render as live, fillable inputs instead of design
+   *  rectangles. Drives the Preview toggle on the Form toolbar. */
+  formPreview: boolean
+  /** Per-page crop rectangles (PDF user-space). Applied at save time. */
+  cropByPage: Record<number, CropRect>
   /** Past snapshots of byPage for undo. Most-recent at the end. */
   history: ByPage[]
   /** Snapshots created by undo, available to redo. Next-to-redo at index 0. */
@@ -179,6 +196,16 @@ type AnnotationState = {
   setEditableRegions: (pageNumber: number, regions: EditableTextRegion[]) => void
   setRegionEdit: (regionId: string, text: string | null) => void
   clearAllRegionEdits: () => void
+  addFormFieldAnnotation: (a: Omit<FormFieldAnnotation, 'id' | 'kind' | 'createdAt'>) => string
+  moveFormField: (id: string, x: number, y: number, opts?: { commitHistory?: boolean }) => void
+  resizeFormField: (
+    id: string,
+    patch: { x?: number; y?: number; width?: number; height?: number },
+    opts?: { commitHistory?: boolean }
+  ) => void
+  updateFormField: (id: string, patch: Partial<Omit<FormFieldAnnotation, 'id' | 'kind' | 'createdAt'>>) => void
+  setFormPreview: (v: boolean) => void
+  setCropForPage: (pageNumber: number, rect: CropRect | null) => void
   moveSignature: (id: string, x: number, y: number, opts?: { commitHistory?: boolean }) => void
   resizeSignature: (
     id: string,
@@ -241,6 +268,8 @@ export const useAnnotationStore = create<AnnotationState>((set, get) => ({
   pageNumbering: DEFAULT_PAGE_NUMBER,
   editableRegions: {},
   editedRegions: {},
+  formPreview: false,
+  cropByPage: {},
   history: [],
   future: [],
 
@@ -616,6 +645,100 @@ export const useAnnotationStore = create<AnnotationState>((set, get) => ({
     }),
 
   clearAllRegionEdits: () => set({ editedRegions: {} }),
+
+  addFormFieldAnnotation: (a) => {
+    const id = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 9)}`
+    const ann: FormFieldAnnotation = { id, kind: 'form-field', createdAt: Date.now(), ...a }
+    set((st) => ({
+      ...withHistory(st, {
+        ...st.byPage,
+        [a.pageNumber]: [...(st.byPage[a.pageNumber] ?? []), ann]
+      }),
+      selectedId: id
+    }))
+    return id
+  },
+
+  moveFormField: (id, x, y, opts) => {
+    set((st) => {
+      const out: ByPage = {}
+      let changed = false
+      for (const [pn, arr] of Object.entries(st.byPage)) {
+        const mapped = arr.map((a) => {
+          if (a.id === id && a.kind === 'form-field' && (a.x !== x || a.y !== y)) {
+            changed = true
+            return { ...a, x, y }
+          }
+          return a
+        })
+        out[Number(pn)] = mapped
+      }
+      if (!changed) return st
+      if (opts?.commitHistory === false) return { byPage: out }
+      return withHistory(st, out)
+    })
+  },
+
+  resizeFormField: (id, patch, opts) => {
+    set((st) => {
+      const out: ByPage = {}
+      let changed = false
+      for (const [pn, arr] of Object.entries(st.byPage)) {
+        const mapped = arr.map((a) => {
+          if (a.id === id && a.kind === 'form-field') {
+            const next = { ...a, ...patch }
+            if (
+              next.x !== a.x || next.y !== a.y ||
+              next.width !== a.width || next.height !== a.height
+            ) {
+              changed = true
+              return next
+            }
+          }
+          return a
+        })
+        out[Number(pn)] = mapped
+      }
+      if (!changed) return st
+      if (opts?.commitHistory === false) return { byPage: out }
+      return withHistory(st, out)
+    })
+  },
+
+  updateFormField: (id, patch) => {
+    set((st) => {
+      const out: ByPage = {}
+      let changed = false
+      for (const [pn, arr] of Object.entries(st.byPage)) {
+        const mapped = arr.map((a) => {
+          if (a.id === id && a.kind === 'form-field') {
+            const next = { ...a, ...patch } as FormFieldAnnotation
+            let diff = false
+            for (const key of Object.keys(patch) as Array<keyof typeof patch>) {
+              if ((a as Record<string, unknown>)[key] !== (next as Record<string, unknown>)[key]) {
+                diff = true; break
+              }
+            }
+            if (diff) { changed = true; return next }
+          }
+          return a
+        })
+        out[Number(pn)] = mapped
+      }
+      if (!changed) return st
+      return withHistory(st, out)
+    })
+  },
+
+  setFormPreview: (v) => set({ formPreview: v }),
+
+  setCropForPage: (pageNumber, rect) =>
+    set((st) => {
+      const next = { ...st.cropByPage }
+      if (rect === null) delete next[pageNumber]
+      else next[pageNumber] = rect
+      return { cropByPage: next }
+    }),
 
   moveSignature: (id, x, y, opts) => {
     set((st) => {

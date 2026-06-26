@@ -213,7 +213,8 @@ export const useDocumentStore = create<DocState>((set, get) => ({
         {
           editableRegions: annState.editableRegions,
           editedRegions: annState.editedRegions
-        }
+        },
+        annState.cropByPage
       )
       const result = await window.api.writeFile(targetPath, newBytes)
       const writtenPath = result.path
@@ -233,14 +234,27 @@ export const useDocumentStore = create<DocState>((set, get) => ({
   }
 }))
 
+export type TabId =
+  | 'home'
+  | 'annotations'
+  | 'fill-sign'
+  | 'edit'
+  | 'pages'
+  | 'form'
+  | 'tools'
+  | 'protect'
+
 type UiState = {
   isDark: boolean
   sidebarOpen: boolean
   closeConfirmOpen: boolean
+  /** Active toolbar tab — also drives which main-area view is rendered (PdfViewer vs PagesGrid). */
+  activeTab: TabId
   toggleDark: () => void
   toggleSidebar: () => void
   setDark: (v: boolean) => void
   setCloseConfirmOpen: (v: boolean) => void
+  setActiveTab: (t: TabId) => void
   /** Close the current document, prompting first if there are unsaved changes. */
   requestCloseDocument: () => void
 }
@@ -271,6 +285,7 @@ export const useUiStore = create<UiState>((set, get) => {
     isDark: initial.isDark,
     sidebarOpen: initial.sidebarOpen,
     closeConfirmOpen: false,
+    activeTab: 'home' as TabId,
     toggleDark: () => {
       const next = !get().isDark
       set({ isDark: next })
@@ -286,6 +301,7 @@ export const useUiStore = create<UiState>((set, get) => {
       persistUi({ isDark: v, sidebarOpen: get().sidebarOpen })
     },
     setCloseConfirmOpen: (v) => set({ closeConfirmOpen: v }),
+    setActiveTab: (t) => set({ activeTab: t }),
     requestCloseDocument: () => {
       const doc = useDocumentStore.getState()
       if (!doc.pdf) return

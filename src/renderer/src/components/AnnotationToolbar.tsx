@@ -1,5 +1,6 @@
 import { Fragment, useEffect, useRef, useState } from 'react'
-import { useDocumentStore } from '../store/documentStore'
+import { useDocumentStore, useUiStore } from '../store/documentStore'
+import { usePagesStore } from '../store/pagesStore'
 import { useAnnotationStore, type Tool } from '../store/annotationStore'
 import { useSignatureStore } from '../store/signatureStore'
 import {
@@ -280,7 +281,8 @@ export default function AnnotationToolbar() {
     return null
   })()
 
-  const [activeTab, setActiveTab] = useState<TabId>('home')
+  const activeTab = useUiStore((s) => s.activeTab)
+  const setActiveTab = useUiStore((s) => s.setActiveTab)
   const [shapesOpen, setShapesOpen] = useState(false)
   const [convertOpen, setConvertOpen] = useState(false)
   const [signatureOpen, setSignatureOpen] = useState(false)
@@ -315,6 +317,42 @@ export default function AnnotationToolbar() {
   const setPendingAttachment = useAnnotationStore((s) => s.setPendingAttachment)
   const linkActive = useAnnotationStore((s) => s.tool === 'link')
   const editContentActive = useAnnotationStore((s) => s.tool === 'edit-content')
+  const formPreview = useAnnotationStore((s) => s.formPreview)
+  const setFormPreview = useAnnotationStore((s) => s.setFormPreview)
+  const cropActive = useAnnotationStore((s) => s.tool === 'crop')
+  const currentPage = useDocumentStore((s) => s.currentPage)
+  const pdfDoc = useDocumentStore((s) => s.pdf)
+  const setCurrentPage = useDocumentStore((s) => s.setCurrentPage)
+
+  // Tools-tab transient UI state — kept here because nothing else needs it.
+  const [reading, setReading] = useState(false)
+  const [playing, setPlaying] = useState(false)
+  const [ocrOpen, setOcrOpen] = useState(false)
+  const [ocrStatus, setOcrStatus] = useState<string>('')
+  const [ocrText, setOcrText] = useState<string>('')
+  const [ocrRunning, setOcrRunning] = useState(false)
+
+  // Protect-tab transient UI state.
+  const redactActive = useAnnotationStore((s) => s.tool === 'redact')
+  const [encryptOpen, setEncryptOpen] = useState(false)
+  const [encUserPw, setEncUserPw] = useState('')
+  const [encOwnerPw, setEncOwnerPw] = useState('')
+  const [encKeyBits, setEncKeyBits] = useState<40 | 128 | 256>(256)
+  const [encAllowPrint, setEncAllowPrint] = useState(true)
+  const [encAllowModify, setEncAllowModify] = useState(false)
+  const [encAllowExtract, setEncAllowExtract] = useState(false)
+  const [encAllowAnnotate, setEncAllowAnnotate] = useState(true)
+  const encryptRef = useRef<HTMLDivElement>(null)
+  const pagesSelection = usePagesStore((s) => s.selection)
+  const pagesSelectionSize = pagesSelection.size
+  const pagesSelectAll = usePagesStore((s) => s.selectAll)
+  const pagesClear = usePagesStore((s) => s.clear)
+  const pagesSetSelection = usePagesStore((s) => s.setSelection)
+  const pagesZoomIn = usePagesStore((s) => s.zoomIn)
+  const pagesZoomOut = usePagesStore((s) => s.zoomOut)
+  const pagesSetBusy = usePagesStore((s) => s.setBusy)
+  const filePath = useDocumentStore((s) => s.filePath)
+  const loadBytes = useDocumentStore((s) => s.loadBytes)
   const editedRegionsCount = useAnnotationStore(
     (s) => Object.keys(s.editedRegions).length
   )
@@ -399,6 +437,67 @@ export default function AnnotationToolbar() {
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
   }, [pageNumOpen])
+
+  useEffect(() => {
+    if (!encryptOpen) return
+    const onDown = (e: MouseEvent) => {
+      if (!encryptRef.current?.contains(e.target as Node)) setEncryptOpen(false)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [encryptOpen])
+
+  // Slideshow autoplay — when Play is toggled on, advance every 4 seconds.
+  useEffect(() => {
+    if (!playing) return
+    const id = window.setInterval(() => {
+      const doc = useDocumentStore.getState()
+      const next = doc.currentPage + 1
+      if (next > doc.numPages) {
+        setPlaying(false)
+        return
+      }
+      setCurrentPage(next)
+    }, 4000)
+    return () => window.clearInterval(id)
+  }, [playing, setCurrentPage])
+
+  // Read Aloud — extract current page's text and stream it to the browser's
+  // SpeechSynthesis engine. Stop when the button is pressed again or the page
+  // changes.
+  useEffect(() => {
+    if (!reading) {
+      window.speechSynthesis?.cancel()
+      return
+    }
+    let cancelled = false
+    const synth = window.speechSynthesis
+    if (!synth) {
+      setReading(false)
+      return
+    }
+    async function go(): Promise<void> {
+      if (!pdfDoc) { setReading(false); return }
+      const m = await import('../lib/convert/shared')
+      const texts = await m.extractPagesText(pdfDoc)
+      if (cancelled) return
+      const text = texts[currentPage - 1]
+      if (!text || text.trim().length === 0) {
+        setReading(false)
+        return
+      }
+      const u = new SpeechSynthesisUtterance(text)
+      u.onend = () => { if (!cancelled) setReading(false) }
+      u.onerror = () => { if (!cancelled) setReading(false) }
+      synth.cancel()
+      synth.speak(u)
+    }
+    void go()
+    return () => {
+      cancelled = true
+      synth.cancel()
+    }
+  }, [reading, pdfDoc, currentPage])
 
   const pickStampPreset = (text: string, color: string): void => {
     setPendingStamp({ text, color, withDateTime: false })
@@ -548,6 +647,292 @@ export default function AnnotationToolbar() {
     setShapesOpen(false)
   }
 
+  /** Reload the document with mutated bytes. Annotations and region edits are
+   *  intentionally NOT carried forward — page-number-keyed data would be wrong
+   *  after a reorder/delete. We warn before destructive ops. */
+  const reloadWithBytes = async (newBytes: Uint8Array): Promise<void> => {
+    pagesSetBusy(true)
+    try {
+      await loadBytes(newBytes, fileName ?? 'document.pdf', filePath)
+    } finally {
+      pagesSetBusy(false)
+    }
+  }
+
+  const annotationsWillBeLostWarning = (): boolean => {
+    const ann = useAnnotationStore.getState()
+    const hasAnnotations =
+      Object.values(ann.byPage).some((arr) => arr.length > 0) ||
+      Object.keys(ann.editedRegions).length > 0
+    if (!hasAnnotations) return true
+    return window.confirm(
+      'This will discard any unsaved annotations and text edits on the document. Continue?'
+    )
+  }
+
+  const runPagesOp = async (
+    label: string,
+    body: () => Promise<void>
+  ): Promise<void> => {
+    if (!originalBytes) return
+    setError(null)
+    setConverting(label)
+    try {
+      await body()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setConverting(null)
+    }
+  }
+
+  const onPagesNew = async (): Promise<void> => {
+    if (!originalBytes) return
+    if (!annotationsWillBeLostWarning()) return
+    const after = pagesSelectionSize > 0
+      ? Math.max(...Array.from(pagesSelection))
+      : numPages
+    await runPagesOp('Adding page', async () => {
+      const ops = await import('../lib/pages/operations')
+      const { bytes, insertedAt } = await ops.insertBlankPage(originalBytes, after)
+      await reloadWithBytes(bytes)
+      pagesSetSelection([insertedAt])
+    })
+  }
+
+  const onPagesDelete = async (): Promise<void> => {
+    if (!originalBytes || pagesSelectionSize === 0) return
+    if (pagesSelectionSize >= numPages) {
+      window.alert('Cannot delete every page in the document.')
+      return
+    }
+    if (!annotationsWillBeLostWarning()) return
+    await runPagesOp('Deleting pages', async () => {
+      const ops = await import('../lib/pages/operations')
+      const newBytes = await ops.deletePages(originalBytes, pagesSelection)
+      await reloadWithBytes(newBytes)
+      pagesClear()
+    })
+  }
+
+  const onPagesRotate = async (direction: 'left' | 'right'): Promise<void> => {
+    if (!originalBytes) return
+    const target = pagesSelectionSize > 0
+      ? pagesSelection
+      : new Set<number>(Array.from({ length: numPages }, (_, i) => i + 1))
+    await runPagesOp(`Rotating ${direction}`, async () => {
+      const ops = await import('../lib/pages/operations')
+      const newBytes = await ops.rotatePages(originalBytes, target, direction)
+      await reloadWithBytes(newBytes)
+    })
+  }
+
+  const onPagesExtract = async (): Promise<void> => {
+    if (!originalBytes || pagesSelectionSize === 0) return
+    const path = await window.api.showSaveFileDialog({
+      title: 'Save extracted pages',
+      defaultName: (fileName ? fileName.replace(/\.pdf$/i, '') : 'document') + '-extract.pdf',
+      filters: [{ name: 'PDF', extensions: ['pdf'] }]
+    })
+    if (!path) return
+    await runPagesOp('Extracting pages', async () => {
+      const ops = await import('../lib/pages/operations')
+      const newBytes = await ops.extractPages(originalBytes, pagesSelection)
+      await window.api.writeFile(path, newBytes)
+    })
+  }
+
+  const onPagesAppend = async (): Promise<void> => {
+    if (!originalBytes) return
+    const paths = await window.api.showOpenFilesDialog({
+      title: 'Append PDF',
+      filters: [{ name: 'PDF', extensions: ['pdf'] }],
+      multi: false
+    })
+    if (!paths || paths.length === 0) return
+    if (!annotationsWillBeLostWarning()) return
+    await runPagesOp('Appending file', async () => {
+      const ops = await import('../lib/pages/operations')
+      const extra = await window.api.readFile(paths[0])
+      const newBytes = await ops.appendDocument(originalBytes, extra.bytes)
+      await reloadWithBytes(newBytes)
+    })
+  }
+
+  const onPagesSplit = async (): Promise<void> => {
+    if (!originalBytes) return
+    let splitAfter: number
+    if (pagesSelectionSize === 1) {
+      splitAfter = Math.min(...Array.from(pagesSelection))
+    } else {
+      const v = window.prompt(
+        `Split after which page number? (1 - ${numPages - 1})`,
+        String(Math.floor(numPages / 2))
+      )
+      if (!v) return
+      const n = parseInt(v, 10)
+      if (!Number.isFinite(n) || n < 1 || n >= numPages) {
+        window.alert(`Please enter a number between 1 and ${numPages - 1}.`)
+        return
+      }
+      splitAfter = n
+    }
+    const dir = await window.api.showOpenDirectoryDialog('Choose output folder')
+    if (!dir) return
+    await runPagesOp('Splitting document', async () => {
+      const ops = await import('../lib/pages/operations')
+      await ops.splitAt(
+        originalBytes,
+        fileName ?? 'document.pdf',
+        splitAfter,
+        dir,
+        async (p, b) => { await window.api.writeFile(p, b) }
+      )
+    })
+  }
+
+  /** Protect — encrypt the current document with QPDF-wasm and save. */
+  const runEncrypt = async (): Promise<void> => {
+    if (!originalBytes || !encOwnerPw.trim()) {
+      window.alert('Set at least the owner password before encrypting.')
+      return
+    }
+    const path = await window.api.showSaveFileDialog({
+      title: 'Save encrypted PDF',
+      defaultName: (fileName ? fileName.replace(/\.pdf$/i, '') : 'document') + '-protected.pdf',
+      filters: [{ name: 'PDF', extensions: ['pdf'] }]
+    })
+    if (!path) return
+    setError(null)
+    setConverting('Encrypting')
+    try {
+      const { encryptPdf } = await import('../lib/protect/qpdf')
+      const out = await encryptPdf(originalBytes, {
+        userPassword: encUserPw,
+        ownerPassword: encOwnerPw,
+        keyBits: encKeyBits,
+        allowPrint: encAllowPrint,
+        allowModify: encAllowModify,
+        allowExtract: encAllowExtract,
+        allowAnnotate: encAllowAnnotate
+      })
+      await window.api.writeFile(path, out)
+      setEncryptOpen(false)
+      setEncUserPw('')
+      setEncOwnerPw('')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setConverting(null)
+    }
+  }
+
+  /** Protect — strip encryption from a password-protected PDF. */
+  const runDecrypt = async (): Promise<void> => {
+    if (!originalBytes) return
+    const password = window.prompt('Enter the current password to remove protection:', '')
+    if (password === null) return
+    const path = await window.api.showSaveFileDialog({
+      title: 'Save decrypted PDF',
+      defaultName: (fileName ? fileName.replace(/\.pdf$/i, '') : 'document') + '-unlocked.pdf',
+      filters: [{ name: 'PDF', extensions: ['pdf'] }]
+    })
+    if (!path) return
+    setError(null)
+    setConverting('Removing password')
+    try {
+      const { decryptPdf } = await import('../lib/protect/qpdf')
+      const out = await decryptPdf(originalBytes, password)
+      await window.api.writeFile(path, out)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setConverting(null)
+    }
+  }
+
+  /** Protect — flatten form fields so the document can't be re-filled. */
+  const runFlatten = async (): Promise<void> => {
+    if (!originalBytes) return
+    const path = await window.api.showSaveFileDialog({
+      title: 'Save flattened PDF',
+      defaultName: (fileName ? fileName.replace(/\.pdf$/i, '') : 'document') + '-flat.pdf',
+      filters: [{ name: 'PDF', extensions: ['pdf'] }]
+    })
+    if (!path) return
+    setError(null)
+    setConverting('Flattening')
+    try {
+      // Re-use the normal save pipeline first (bakes annotations/regions/decor),
+      // then flatten the resulting bytes so AcroForm fields lose interactivity.
+      const { applyAnnotationsToPdf } = await import('../lib/savePdf')
+      const ann = useAnnotationStore.getState()
+      const baked = await applyAnnotationsToPdf(
+        originalBytes,
+        ann.byPage,
+        null,
+        {
+          watermark: ann.watermark,
+          headerFooter: ann.headerFooter,
+          pageNumbering: ann.pageNumbering
+        },
+        { editableRegions: ann.editableRegions, editedRegions: ann.editedRegions },
+        ann.cropByPage
+      )
+      const { flattenPdf } = await import('../lib/protect/flatten')
+      const out = await flattenPdf(baked)
+      await window.api.writeFile(path, out)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setConverting(null)
+    }
+  }
+
+  /** Tools-tab quick actions that wrap existing Convert ops. */
+  const runCompress = (): Promise<void> => runConvert('compress-pdf')
+  const runMerge = (): Promise<void> => runConvert('merge-pdf')
+  const runSplit = (): Promise<void> => runConvert('split-pdf')
+
+  /** Run Tesseract on the current page and open a result modal. */
+  const runOcr = async (): Promise<void> => {
+    if (!pdfDoc) return
+    setOcrOpen(true)
+    setOcrRunning(true)
+    setOcrText('')
+    setOcrStatus('Loading OCR…')
+    try {
+      const { ocrPage } = await import('../lib/tools/ocr')
+      const text = await ocrPage(pdfDoc, currentPage, (status, progress) => {
+        setOcrStatus(`${status}${progress ? ` — ${Math.round(progress * 100)}%` : ''}`)
+      })
+      setOcrText(text)
+      setOcrStatus('Done')
+    } catch (err) {
+      setOcrStatus(err instanceof Error ? err.message : String(err))
+    } finally {
+      setOcrRunning(false)
+    }
+  }
+
+  /** Open the current page's text in Google Translate. We don't ship a
+   *  translation backend; this just hands the text off to the browser. */
+  const runTranslate = async (): Promise<void> => {
+    if (!pdfDoc) return
+    const m = await import('../lib/convert/shared')
+    const texts = await m.extractPagesText(pdfDoc)
+    const text = texts[currentPage - 1] ?? ''
+    const trimmed = text.trim().slice(0, 4500) // URL length-ish cap
+    if (!trimmed) {
+      window.alert('No extractable text on this page.')
+      return
+    }
+    const url = `https://translate.google.com/?sl=auto&tl=en&op=translate&text=${encodeURIComponent(trimmed)}`
+    // Electron's webContents intercepts target=_blank → shell.openExternal, so
+    // this opens the user's default browser instead of a new Electron window.
+    window.open(url, '_blank')
+  }
+
   const handleText = (): void => {
     if (tool === 'freetext') setTool('select')
     else setTool('freetext')
@@ -627,7 +1012,7 @@ export default function AnnotationToolbar() {
 
       {/* Row 2 — active tab content */}
       <div className="h-11 flex items-center px-3 gap-0.5 border-t border-neutral-200/70 dark:border-neutral-800/70">
-        {isAnnotationContext || activeTab === 'fill-sign' || activeTab === 'edit' ? (
+        {isAnnotationContext || activeTab === 'fill-sign' || activeTab === 'edit' || activeTab === 'pages' || activeTab === 'form' || activeTab === 'tools' || activeTab === 'protect' ? (
           <>
             {isAnnotationContext && (
               <>
@@ -1601,6 +1986,724 @@ export default function AnnotationToolbar() {
               </>
             )}
 
+            {activeTab === 'pages' && (
+              <>
+                {/* Zoom out / Zoom in — control thumbnail size in the grid. */}
+                <button
+                  onClick={pagesZoomOut}
+                  title="Smaller thumbnails"
+                  className="h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                >
+                  <Svg>
+                    <circle cx="10" cy="10" r="6" />
+                    <path d="m15 15 5 5" />
+                    <path d="M7 10h6" />
+                  </Svg>
+                  <span>Zoom out</span>
+                </button>
+                <button
+                  onClick={pagesZoomIn}
+                  title="Larger thumbnails"
+                  className="h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                >
+                  <Svg>
+                    <circle cx="10" cy="10" r="6" />
+                    <path d="m15 15 5 5" />
+                    <path d="M7 10h6M10 7v6" />
+                  </Svg>
+                  <span>Zoom in</span>
+                </button>
+
+                <div className="w-px h-6 bg-neutral-300/70 dark:bg-neutral-700/70 mx-1 shrink-0" />
+
+                {/* New — insert a blank page after the last selected (or end). */}
+                <button
+                  onClick={() => { void onPagesNew() }}
+                  title="Insert a blank page after the selected page"
+                  className="h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                >
+                  <Svg>
+                    <rect x="5" y="3" width="14" height="18" rx="2" />
+                    <path d="M12 9v6M9 12h6" />
+                  </Svg>
+                  <span>New</span>
+                </button>
+
+                <button
+                  onClick={() => { void onPagesSplit() }}
+                  title="Split into two PDFs at a page boundary"
+                  className="h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                >
+                  <Svg>
+                    <rect x="4" y="3" width="7" height="18" rx="1.5" />
+                    <rect x="13" y="3" width="7" height="18" rx="1.5" />
+                    <path d="M12 5v14" strokeDasharray="2 2" />
+                  </Svg>
+                  <span>Split</span>
+                </button>
+
+                <button
+                  onClick={() => { void onPagesExtract() }}
+                  disabled={pagesSelectionSize === 0}
+                  title="Save selected pages as a new PDF"
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    pagesSelectionSize === 0
+                      ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                      : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg>
+                    <rect x="4" y="3" width="14" height="18" rx="2" />
+                    <path d="M15 14l5 5M20 14v5h-5" />
+                  </Svg>
+                  <span>Extract</span>
+                </button>
+
+                <button
+                  onClick={() => { void onPagesAppend() }}
+                  title="Append another PDF to the end of this one"
+                  className="h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                >
+                  <Svg>
+                    <rect x="4" y="3" width="14" height="18" rx="2" />
+                    <path d="M11 14v-4M9 12h4" />
+                    <path d="m18 8 3 3-3 3" />
+                  </Svg>
+                  <span>Append File</span>
+                </button>
+
+                <button
+                  onClick={() => { void onPagesDelete() }}
+                  disabled={pagesSelectionSize === 0}
+                  title="Delete selected pages"
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    pagesSelectionSize === 0
+                      ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                      : 'text-red-600 dark:text-red-400 hover:bg-red-500/10'
+                  }`}
+                >
+                  <Svg>
+                    <path d="M4 7h16" />
+                    <path d="M9 7V4h6v3" />
+                    <path d="M6 7v13a1 1 0 0 0 1 1h10a1 1 0 0 0 1-1V7" />
+                  </Svg>
+                  <span>Delete</span>
+                </button>
+
+                <div className="w-px h-6 bg-neutral-300/70 dark:bg-neutral-700/70 mx-1 shrink-0" />
+
+                <button
+                  onClick={() => { void onPagesRotate('left') }}
+                  title={pagesSelectionSize > 0 ? 'Rotate selected pages 90° left' : 'Rotate all pages 90° left'}
+                  className="h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                >
+                  <Svg>
+                    <path d="M3 8c0-2.5 2-4.5 4.5-4.5H13" />
+                    <path d="M6 11 3 8l3-3" />
+                    <rect x="9" y="11" width="11" height="10" rx="1.5" />
+                  </Svg>
+                  <span>Rotate Left</span>
+                </button>
+                <button
+                  onClick={() => { void onPagesRotate('right') }}
+                  title={pagesSelectionSize > 0 ? 'Rotate selected pages 90° right' : 'Rotate all pages 90° right'}
+                  className="h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                >
+                  <Svg>
+                    <path d="M21 8c0-2.5-2-4.5-4.5-4.5H11" />
+                    <path d="M18 11l3-3-3-3" />
+                    <rect x="4" y="11" width="11" height="10" rx="1.5" />
+                  </Svg>
+                  <span>Rotate Right</span>
+                </button>
+
+                {/* Selection summary */}
+                <div className="ml-auto flex items-center gap-2 text-[11px] text-neutral-500 dark:text-neutral-400">
+                  {pagesSelectionSize > 0 ? (
+                    <>
+                      <span className="tabular-nums">{pagesSelectionSize} / {numPages} selected</span>
+                      <button
+                        onClick={pagesClear}
+                        className="h-6 px-2 text-[11px] rounded hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                      >
+                        Clear
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={() => pagesSelectAll(numPages)}
+                      className="h-6 px-2 text-[11px] rounded hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                    >
+                      Select all (⌘A)
+                    </button>
+                  )}
+                </div>
+              </>
+            )}
+
+            {activeTab === 'protect' && (
+              <>
+                <button
+                  onClick={() => setTool('select')}
+                  title="Select / pan"
+                  aria-pressed={tool === 'select'}
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    tool === 'select'
+                      ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                      : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg><path d="M5 3l6 16 2-7 7-2L5 3Z" /></Svg>
+                  <span>Select</span>
+                </button>
+                <button
+                  onClick={() => setTool('select')}
+                  title="Hand — pan the page"
+                  className="h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                >
+                  <Svg>
+                    <path d="M9 11V5a1.5 1.5 0 0 1 3 0v6" />
+                    <path d="M12 11V4a1.5 1.5 0 0 1 3 0v8" />
+                    <path d="M15 12V6a1.5 1.5 0 0 1 3 0v10a5 5 0 0 1-5 5h-2a5 5 0 0 1-4-2l-3-5a1.7 1.7 0 0 1 .5-2.3 1.7 1.7 0 0 1 2.3.5L9 16" />
+                  </Svg>
+                  <span>Hand</span>
+                </button>
+
+                <div className="w-px h-6 bg-neutral-300/70 dark:bg-neutral-700/70 mx-1 shrink-0" />
+
+                {/* Redact — drag a box; saved as a solid black rectangle. */}
+                <button
+                  onClick={() => setTool(redactActive ? 'select' : 'redact')}
+                  title="Redact — drag a rectangle to black out content"
+                  aria-pressed={redactActive}
+                  disabled={numPages === 0}
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    redactActive
+                      ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                      : numPages === 0
+                        ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                        : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg>
+                    <rect x="3" y="6" width="18" height="12" rx="1" fill="currentColor" stroke="none" />
+                    <path d="M4 4l16 16" stroke="white" strokeOpacity={0.4} />
+                  </Svg>
+                  <span>Redact</span>
+                </button>
+
+                {/* Encrypt — inline panel with passwords + permissions. */}
+                <div className="relative" ref={encryptRef}>
+                  <button
+                    onClick={() => setEncryptOpen((v) => !v)}
+                    title="Encrypt with passwords + permissions"
+                    aria-haspopup="menu"
+                    aria-expanded={encryptOpen}
+                    disabled={numPages === 0}
+                    className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                      encryptOpen
+                        ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                        : numPages === 0
+                          ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                          : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                    }`}
+                  >
+                    <span className="inline-flex items-center gap-0.5">
+                      <Svg>
+                        <rect x="5" y="11" width="14" height="9" rx="1.5" />
+                        <path d="M8 11V7a4 4 0 0 1 8 0v4" />
+                      </Svg>
+                      <svg viewBox="0 0 8 8" className="w-2 h-2" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M1.5 3 4 5.5 6.5 3" />
+                      </svg>
+                    </span>
+                    <span>Encrypt</span>
+                  </button>
+                  {encryptOpen && (
+                    <div role="menu" className="absolute top-full left-0 mt-1 w-80 p-3 rounded-md bg-white dark:bg-neutral-800 shadow-lg border border-neutral-200 dark:border-neutral-700 z-40 flex flex-col gap-2">
+                      <div className="text-[10px] uppercase tracking-wide text-neutral-500 dark:text-neutral-400">Passwords</div>
+                      <input
+                        type="password"
+                        value={encOwnerPw}
+                        onChange={(e) => setEncOwnerPw(e.target.value)}
+                        placeholder="Owner password (required)"
+                        className="h-7 px-2 text-xs rounded bg-neutral-100 dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 text-neutral-800 dark:text-neutral-100 focus:outline-none focus:ring-1 focus:ring-blue-500/40"
+                      />
+                      <input
+                        type="password"
+                        value={encUserPw}
+                        onChange={(e) => setEncUserPw(e.target.value)}
+                        placeholder="User password (optional — leave blank to allow viewing without)"
+                        className="h-7 px-2 text-xs rounded bg-neutral-100 dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 text-neutral-800 dark:text-neutral-100 focus:outline-none focus:ring-1 focus:ring-blue-500/40"
+                      />
+                      <div className="flex items-center gap-2">
+                        <span className="text-[10px] uppercase tracking-wide text-neutral-500 dark:text-neutral-400">Strength</span>
+                        <select
+                          value={encKeyBits}
+                          onChange={(e) => setEncKeyBits(Number(e.target.value) as 40 | 128 | 256)}
+                          className="h-7 px-2 text-xs rounded bg-neutral-100 dark:bg-neutral-900 border border-neutral-300 dark:border-neutral-700 text-neutral-800 dark:text-neutral-100"
+                        >
+                          <option value={256}>AES 256-bit</option>
+                          <option value={128}>AES 128-bit</option>
+                          <option value={40}>RC4 40-bit (legacy)</option>
+                        </select>
+                      </div>
+                      <div className="border-t border-neutral-200 dark:border-neutral-700 my-1" />
+                      <div className="text-[10px] uppercase tracking-wide text-neutral-500 dark:text-neutral-400">User permissions</div>
+                      <div className="grid grid-cols-2 gap-1 text-[11px]">
+                        <label className="flex items-center gap-1.5">
+                          <input type="checkbox" checked={encAllowPrint} onChange={(e) => setEncAllowPrint(e.target.checked)} />
+                          Print
+                        </label>
+                        <label className="flex items-center gap-1.5">
+                          <input type="checkbox" checked={encAllowModify} onChange={(e) => setEncAllowModify(e.target.checked)} />
+                          Modify
+                        </label>
+                        <label className="flex items-center gap-1.5">
+                          <input type="checkbox" checked={encAllowExtract} onChange={(e) => setEncAllowExtract(e.target.checked)} />
+                          Copy / extract
+                        </label>
+                        <label className="flex items-center gap-1.5">
+                          <input type="checkbox" checked={encAllowAnnotate} onChange={(e) => setEncAllowAnnotate(e.target.checked)} />
+                          Annotate
+                        </label>
+                      </div>
+                      <button
+                        onClick={() => { void runEncrypt() }}
+                        disabled={!encOwnerPw.trim()}
+                        className={`mt-2 h-7 px-3 text-xs rounded text-white transition ${
+                          encOwnerPw.trim() ? 'bg-blue-500 hover:bg-blue-600' : 'bg-neutral-400 dark:bg-neutral-600 cursor-not-allowed'
+                        }`}
+                      >
+                        Encrypt &amp; save…
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                <button
+                  onClick={() => { void runDecrypt() }}
+                  title="Remove the document password"
+                  disabled={numPages === 0}
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    numPages === 0
+                      ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                      : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg>
+                    <rect x="5" y="11" width="14" height="9" rx="1.5" />
+                    <path d="M8 11V7a4 4 0 0 1 4-4" />
+                    <path d="M12 14v3" />
+                  </Svg>
+                  <span>Remove Password</span>
+                </button>
+
+                <button
+                  onClick={() => { void runFlatten() }}
+                  title="Flatten — bake annotations + form fields so they can't be edited"
+                  disabled={numPages === 0}
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    numPages === 0
+                      ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                      : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg>
+                    <rect x="4" y="4" width="16" height="16" rx="2" />
+                    <path d="M4 11h16" />
+                    <path d="M9 17l3-3 3 3" />
+                  </Svg>
+                  <span>Flatten</span>
+                </button>
+              </>
+            )}
+
+            {activeTab === 'tools' && (
+              <>
+                {/* Select + Hand pair */}
+                <button
+                  onClick={() => setTool('select')}
+                  title="Select / pan"
+                  aria-pressed={tool === 'select'}
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    tool === 'select'
+                      ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                      : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg><path d="M5 3l6 16 2-7 7-2L5 3Z" /></Svg>
+                  <span>Select</span>
+                </button>
+                <button
+                  onClick={() => setTool('select')}
+                  title="Hand — pan the page"
+                  className="h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                >
+                  <Svg>
+                    <path d="M9 11V5a1.5 1.5 0 0 1 3 0v6" />
+                    <path d="M12 11V4a1.5 1.5 0 0 1 3 0v8" />
+                    <path d="M15 12V6a1.5 1.5 0 0 1 3 0v10a5 5 0 0 1-5 5h-2a5 5 0 0 1-4-2l-3-5a1.7 1.7 0 0 1 .5-2.3 1.7 1.7 0 0 1 2.3.5L9 16" />
+                  </Svg>
+                  <span>Hand</span>
+                </button>
+
+                <div className="w-px h-6 bg-neutral-300/70 dark:bg-neutral-700/70 mx-1 shrink-0" />
+
+                {/* Convert — reuses the same dropdown as Home for parity. */}
+                <div className="relative" ref={convertRef}>
+                  <button
+                    onClick={() => setConvertOpen((v) => !v)}
+                    title="Convert"
+                    aria-haspopup="menu"
+                    aria-expanded={convertOpen}
+                    className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                      convertOpen
+                        ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                        : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                    }`}
+                  >
+                    <span className="inline-flex items-center gap-0.5">
+                      {ConvertIcon}
+                      <svg viewBox="0 0 8 8" className="w-2 h-2" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M1.5 3 4 5.5 6.5 3" />
+                      </svg>
+                    </span>
+                    <span>Convert</span>
+                  </button>
+                  {convertOpen && (
+                    <div
+                      role="menu"
+                      className="absolute top-full left-0 mt-1 w-64 py-1 rounded-md bg-white dark:bg-neutral-800 shadow-lg border border-neutral-200 dark:border-neutral-700 z-40 max-h-[70vh] overflow-y-auto"
+                    >
+                      {CONVERT_GROUPS.map((group, gi) => (
+                        <div key={group.title}>
+                          {gi > 0 && <div className="my-1 border-t border-neutral-200 dark:border-neutral-700" />}
+                          <div className="px-3 pt-1.5 pb-0.5 text-[10px] font-semibold uppercase tracking-wide text-neutral-500 dark:text-neutral-400">
+                            {group.title}
+                          </div>
+                          {group.items.map((item) => {
+                            const disabled = item.needsDoc && numPages === 0
+                            return (
+                              <button
+                                key={item.id}
+                                role="menuitem"
+                                disabled={disabled}
+                                onClick={() => {
+                                  setConvertOpen(false)
+                                  void runConvert(item.id)
+                                }}
+                                title={disabled ? `${item.label} — open a PDF first` : item.label}
+                                className={`w-full flex items-center gap-2.5 px-3 py-1.5 text-left text-xs transition ${
+                                  disabled
+                                    ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                                    : 'text-neutral-800 dark:text-neutral-100 hover:bg-neutral-100 dark:hover:bg-neutral-700/70'
+                                }`}
+                              >
+                                <span
+                                  className="inline-flex items-center justify-center h-6 w-6 shrink-0 rounded text-[9px] font-bold text-white"
+                                  style={{ background: item.tint, opacity: disabled ? 0.4 : 1 }}
+                                >
+                                  {item.badge}
+                                </span>
+                                <span className="flex-1 truncate">{item.label}</span>
+                              </button>
+                            )
+                          })}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+
+                {/* Common PDF ops — straight buttons that delegate to the
+                    existing Convert pipeline so save dialogs feel consistent. */}
+                <button
+                  onClick={() => { void runCompress() }}
+                  disabled={numPages === 0}
+                  title="Compress PDF"
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    numPages === 0
+                      ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                      : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg>
+                    <rect x="4" y="3" width="16" height="18" rx="2" />
+                    <path d="M9 9l6 6M15 9l-6 6" />
+                  </Svg>
+                  <span>Compress PDF</span>
+                </button>
+                <button
+                  onClick={() => { void runMerge() }}
+                  disabled={numPages === 0}
+                  title="Merge PDF"
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    numPages === 0
+                      ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                      : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg>
+                    <path d="M6 3h8l4 4v14H6z" />
+                    <path d="M14 3v4h4" />
+                    <path d="M10 12h4M10 16h4" />
+                  </Svg>
+                  <span>Merge PDF</span>
+                </button>
+                <button
+                  onClick={() => { void runSplit() }}
+                  disabled={numPages === 0}
+                  title="Split PDF"
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    numPages === 0
+                      ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                      : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg>
+                    <rect x="4" y="3" width="7" height="18" rx="1.5" />
+                    <rect x="13" y="3" width="7" height="18" rx="1.5" />
+                    <path d="M12 5v14" strokeDasharray="2 2" />
+                  </Svg>
+                  <span>Split PDF</span>
+                </button>
+
+                <div className="w-px h-6 bg-neutral-300/70 dark:bg-neutral-700/70 mx-1 shrink-0" />
+
+                {/* OCR — lazy-loads Tesseract.js on first use. */}
+                <button
+                  onClick={() => { void runOcr() }}
+                  disabled={numPages === 0 || ocrRunning}
+                  title="Detect text on current page (OCR)"
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    numPages === 0 || ocrRunning
+                      ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                      : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg>
+                    <path d="M3 8V5a2 2 0 0 1 2-2h3" />
+                    <path d="M21 8V5a2 2 0 0 0-2-2h-3" />
+                    <path d="M3 16v3a2 2 0 0 0 2 2h3" />
+                    <path d="M21 16v3a2 2 0 0 1-2 2h-3" />
+                    <path d="M8 12h8" />
+                  </Svg>
+                  <span>OCR</span>
+                </button>
+
+                <button
+                  onClick={() => { void runTranslate() }}
+                  disabled={numPages === 0}
+                  title="Translate current page in your browser"
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    numPages === 0
+                      ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                      : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg>
+                    <path d="M3 6h8" />
+                    <path d="M7 4v2" />
+                    <path d="M3 10c2 4 6 4 8 0" />
+                    <path d="M11 18h10" />
+                    <path d="M16 12l-5 9M16 12l5 9" />
+                  </Svg>
+                  <span>Translate</span>
+                </button>
+
+                <button
+                  onClick={() => setReading((v) => !v)}
+                  disabled={numPages === 0}
+                  title={reading ? 'Stop reading' : 'Read this page aloud'}
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    reading
+                      ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                      : numPages === 0
+                        ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                        : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg>
+                    <path d="M4 9h3l5-4v14l-5-4H4z" />
+                    <path d="M17 8a4 4 0 0 1 0 8" />
+                    <path d="M20 5a8 8 0 0 1 0 14" opacity={reading ? 0.7 : 0.35} />
+                  </Svg>
+                  <span>{reading ? 'Stop' : 'Read Aloud'}</span>
+                </button>
+
+                <button
+                  onClick={() => setTool(cropActive ? 'select' : 'crop')}
+                  disabled={numPages === 0}
+                  title="Crop — drag a rectangle on the page; saved PDF uses it as the crop box"
+                  aria-pressed={cropActive}
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    cropActive
+                      ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                      : numPages === 0
+                        ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                        : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg>
+                    <path d="M6 2v13a1 1 0 0 0 1 1h13" />
+                    <path d="M2 6h13a1 1 0 0 1 1 1v13" />
+                  </Svg>
+                  <span>Crop</span>
+                </button>
+
+                <button
+                  onClick={() => setPlaying((v) => !v)}
+                  disabled={numPages === 0}
+                  title={playing ? 'Stop slideshow' : 'Play as slideshow (4s/page)'}
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    playing
+                      ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                      : numPages === 0
+                        ? 'text-neutral-400 dark:text-neutral-600 cursor-not-allowed'
+                        : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  {playing ? (
+                    <Svg>
+                      <rect x="6" y="5" width="4" height="14" rx="1" />
+                      <rect x="14" y="5" width="4" height="14" rx="1" />
+                    </Svg>
+                  ) : (
+                    <Svg>
+                      <circle cx="12" cy="12" r="9" />
+                      <path d="M10 8l6 4-6 4z" />
+                    </Svg>
+                  )}
+                  <span>{playing ? 'Pause' : 'Play'}</span>
+                </button>
+              </>
+            )}
+
+            {activeTab === 'form' && (
+              <>
+                {/* Select — exits any active form-tool. */}
+                <button
+                  onClick={() => setTool('select')}
+                  title="Select / pan"
+                  aria-pressed={tool === 'select'}
+                  className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+                    tool === 'select'
+                      ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
+                      : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+                  }`}
+                >
+                  <Svg><path d="M5 3l6 16 2-7 7-2L5 3Z" /></Svg>
+                  <span>Select</span>
+                </button>
+
+                {/* Hand — alias for Select; matches the reference layout. */}
+                <button
+                  onClick={() => setTool('select')}
+                  title="Hand — pan the page"
+                  className="h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70 transition"
+                >
+                  <Svg>
+                    <path d="M9 11V5a1.5 1.5 0 0 1 3 0v6" />
+                    <path d="M12 11V4a1.5 1.5 0 0 1 3 0v8" />
+                    <path d="M15 12V6a1.5 1.5 0 0 1 3 0v10a5 5 0 0 1-5 5h-2a5 5 0 0 1-4-2l-3-5a1.7 1.7 0 0 1 .5-2.3 1.7 1.7 0 0 1 2.3.5L9 16" />
+                  </Svg>
+                  <span>Hand</span>
+                </button>
+
+                <div className="w-px h-6 bg-neutral-300/70 dark:bg-neutral-700/70 mx-1 shrink-0" />
+
+                <FormToolButton
+                  active={tool === 'form-text'}
+                  onClick={() => setTool(tool === 'form-text' ? 'select' : 'form-text')}
+                  title="Text field"
+                  label="Text Field"
+                >
+                  <Svg>
+                    <rect x="3" y="7" width="18" height="10" rx="1.5" />
+                    <path d="M7 10v4" />
+                    <path d="M5 10h4M5 14h4" />
+                  </Svg>
+                </FormToolButton>
+
+                <FormToolButton
+                  active={tool === 'form-checkbox'}
+                  onClick={() => setTool(tool === 'form-checkbox' ? 'select' : 'form-checkbox')}
+                  title="Check box"
+                  label="Check Box"
+                >
+                  <Svg>
+                    <rect x="4" y="4" width="16" height="16" rx="2" />
+                    <path d="m8 12 3 3 6-7" />
+                  </Svg>
+                </FormToolButton>
+
+                <FormToolButton
+                  active={tool === 'form-radio'}
+                  onClick={() => setTool(tool === 'form-radio' ? 'select' : 'form-radio')}
+                  title="Radio button"
+                  label="Radio Button"
+                >
+                  <Svg>
+                    <circle cx="12" cy="12" r="8" />
+                    <circle cx="12" cy="12" r="3.5" fill="currentColor" stroke="none" />
+                  </Svg>
+                </FormToolButton>
+
+                <FormToolButton
+                  active={tool === 'form-dropdown'}
+                  onClick={() => setTool(tool === 'form-dropdown' ? 'select' : 'form-dropdown')}
+                  title="Dropdown"
+                  label="Dropdown"
+                >
+                  <Svg>
+                    <rect x="3" y="7" width="18" height="10" rx="1.5" />
+                    <path d="m14 11 2 2 2-2" />
+                  </Svg>
+                </FormToolButton>
+
+                <FormToolButton
+                  active={tool === 'form-listbox'}
+                  onClick={() => setTool(tool === 'form-listbox' ? 'select' : 'form-listbox')}
+                  title="List box"
+                  label="List Box"
+                >
+                  <Svg>
+                    <rect x="3" y="4" width="18" height="16" rx="1.5" />
+                    <path d="M6 8h12M6 12h12M6 16h7" />
+                  </Svg>
+                </FormToolButton>
+
+                <div className="w-px h-6 bg-neutral-300/70 dark:bg-neutral-700/70 mx-1 shrink-0" />
+
+                {/* Preview toggle — switches fields between design rectangles and live widgets. */}
+                <button
+                  onClick={() => {
+                    setFormPreview(!formPreview)
+                    if (!formPreview) setTool('select')
+                  }}
+                  title={formPreview ? 'Preview is on — switch back to design' : 'Preview the form (fields become live inputs)'}
+                  aria-pressed={formPreview}
+                  className="h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-1 rounded-md text-[10.5px] font-medium leading-tight transition text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70"
+                >
+                  <span
+                    className={`relative inline-block w-9 h-5 rounded-full transition ${
+                      formPreview ? 'bg-blue-500' : 'bg-neutral-300 dark:bg-neutral-600'
+                    }`}
+                  >
+                    <span
+                      className="absolute top-0.5 left-0.5 w-4 h-4 rounded-full bg-white shadow"
+                      style={{
+                        transform: formPreview ? 'translateX(16px)' : 'translateX(0)',
+                        transition: 'transform 120ms'
+                      }}
+                    />
+                  </span>
+                  <span>Preview</span>
+                </button>
+              </>
+            )}
+
           </>
         ) : (
           <div className="flex-1 flex items-center justify-center text-xs italic text-neutral-500 dark:text-neutral-400">
@@ -1711,7 +2814,92 @@ export default function AnnotationToolbar() {
           onSaved={() => setTool('signature')}
         />
       )}
+
+      {ocrOpen && (
+        <div
+          className="fixed inset-0 z-50 bg-black/40 flex items-center justify-center p-6"
+          onClick={() => { if (!ocrRunning) setOcrOpen(false) }}
+        >
+          <div
+            className="bg-white dark:bg-neutral-800 rounded-lg shadow-xl w-[40rem] max-w-full max-h-[80vh] flex flex-col"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between px-4 py-2 border-b border-neutral-200 dark:border-neutral-700">
+              <span className="text-sm font-semibold text-neutral-800 dark:text-neutral-100">
+                OCR — Page {currentPage}
+              </span>
+              <button
+                onClick={() => setOcrOpen(false)}
+                disabled={ocrRunning}
+                className="h-6 w-6 inline-flex items-center justify-center rounded text-neutral-500 hover:bg-neutral-200 dark:hover:bg-neutral-700 disabled:opacity-40"
+                aria-label="Close"
+              >×</button>
+            </div>
+            <div className="flex-1 overflow-auto p-4">
+              {ocrRunning ? (
+                <div className="flex flex-col items-center justify-center py-12 text-sm text-neutral-500 gap-2">
+                  <div className="animate-pulse">{ocrStatus || 'Processing…'}</div>
+                  <div className="text-[11px]">First run downloads the recognition model (~13 MB)</div>
+                </div>
+              ) : ocrText ? (
+                <pre className="whitespace-pre-wrap font-mono text-xs leading-relaxed text-neutral-800 dark:text-neutral-100">
+                  {ocrText}
+                </pre>
+              ) : (
+                <div className="text-sm text-red-600">{ocrStatus || 'No text recognized.'}</div>
+              )}
+            </div>
+            {!ocrRunning && ocrText && (
+              <div className="flex items-center justify-end gap-2 px-4 py-2 border-t border-neutral-200 dark:border-neutral-700">
+                <button
+                  onClick={() => { void navigator.clipboard.writeText(ocrText) }}
+                  className="h-7 px-3 text-xs rounded bg-neutral-200 dark:bg-neutral-700 text-neutral-800 dark:text-neutral-100 hover:bg-neutral-300 dark:hover:bg-neutral-600 transition"
+                >
+                  Copy
+                </button>
+                <button
+                  onClick={() => setOcrOpen(false)}
+                  className="h-7 px-3 text-xs rounded bg-blue-500 text-white hover:bg-blue-600 transition"
+                >
+                  Done
+                </button>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
+  )
+}
+
+/** Compact toolbar button used by every Form field-tool entry. */
+function FormToolButton({
+  active,
+  onClick,
+  title,
+  label,
+  children
+}: {
+  active: boolean
+  onClick: () => void
+  title: string
+  label: string
+  children: React.ReactNode
+}): JSX.Element {
+  return (
+    <button
+      onClick={onClick}
+      title={title}
+      aria-pressed={active}
+      className={`h-9 min-w-[3rem] px-2 flex flex-col items-center justify-center gap-0 rounded-md text-[10.5px] font-medium leading-tight transition ${
+        active
+          ? 'bg-blue-500/15 text-blue-600 dark:text-blue-400'
+          : 'text-neutral-700 dark:text-neutral-200 hover:bg-neutral-200/70 dark:hover:bg-neutral-800/70'
+      }`}
+    >
+      {children}
+      <span>{label}</span>
+    </button>
   )
 }
 

@@ -16,6 +16,7 @@ import type {
   AttachedImageAnnotation,
   EditableTextRegion,
   FontFamily,
+  FormFieldAnnotation,
   FreeTextAnnotation,
   HeaderFooterSettings,
   ImageAnnotation,
@@ -55,12 +56,16 @@ export type RegionEdits = {
   editedRegions?: Record<string, string>
 }
 
+/** Per-page crop rectangle in PDF user space. */
+export type PageCrops = Record<number, { x: number; y: number; width: number; height: number }>
+
 export async function applyAnnotationsToPdf(
   originalBytes: Uint8Array,
   byPage: Record<number, Annotation[]>,
   pageTexts: PageText[] | null,
   decor: DocumentDecor = {},
-  regionEdits: RegionEdits = {}
+  regionEdits: RegionEdits = {},
+  pageCrops: PageCrops = {}
 ): Promise<Uint8Array> {
   const pdfDoc = await PDFDocument.load(originalBytes, { updateMetadata: false })
   const pages = pdfDoc.getPages()
@@ -110,6 +115,8 @@ export async function applyAnnotationsToPdf(
       } else if (ann.kind === 'link') {
         const ref = buildLinkAnnot(pdfDoc, page, ann)
         addAnnotToPage(pdfDoc, page, ref)
+      } else if (ann.kind === 'form-field') {
+        addFormFieldToPdf(pdfDoc, page, ann)
       }
     }
   }
@@ -150,6 +157,16 @@ export async function applyAnnotationsToPdf(
         drawPageNumberOnPage(page, decor.pageNumbering, helvetica, i + 1, totalPages)
       }
     }
+  }
+
+  // Crop boxes are applied last so they survive every other transformation.
+  // Setting a crop box doesn't remove content — it just tells the viewer to
+  // clip rendering, which is what users intuitively expect from "crop".
+  for (const [pageNumStr, rect] of Object.entries(pageCrops)) {
+    const idx = Number(pageNumStr) - 1
+    const page = pages[idx]
+    if (!page) continue
+    page.setCropBox(rect.x, rect.y, rect.width, rect.height)
   }
 
   return pdfDoc.save()
@@ -242,6 +259,15 @@ function drawShapeOnPage(page: PDFPage, ann: ShapeAnnotation): void {
       thickness: sw,
       color
     })
+  } else if (ann.shape === 'redact') {
+    // Solid black rectangle covering the redacted region. Note: the underlying
+    // content stream is unchanged — this is visual redaction only. True
+    // redaction (removing the text glyphs) needs content-stream rewriting.
+    const x = Math.min(ann.x1, ann.x2)
+    const y = Math.min(ann.y1, ann.y2)
+    const width = Math.abs(ann.x2 - ann.x1)
+    const height = Math.abs(ann.y2 - ann.y1)
+    page.drawRectangle({ x, y, width, height, color: rgb(0, 0, 0) })
   } else if ((ann.shape === 'ink' || ann.shape === 'marker') && ann.points && ann.points.length >= 2) {
     // Marker = highlighter — same freehand stroke but rendered translucently
     // so underlying text remains readable.
@@ -642,6 +668,103 @@ function drawEditedRegion(
       font,
       color: textColor
     })
+  }
+}
+
+/** Bake a designed form-field annotation into a real AcroForm widget on the
+ *  page. Field names are reused across the document so radio buttons sharing a
+ *  name automatically group into one PDF radio group. */
+function addFormFieldToPdf(
+  pdfDoc: PDFDocument,
+  page: PDFPage,
+  ann: FormFieldAnnotation
+): void {
+  const form = pdfDoc.getForm()
+  const x = ann.x
+  const y = ann.y - ann.height
+  const width = ann.width
+  const height = ann.height
+
+  try {
+    if (ann.fieldType === 'text') {
+      // pdf-lib upserts on createTextField when the name already exists; reuse
+      // returns the existing field, which is exactly what we want for repeated
+      // names. Any later widgets added share the same field value.
+      const f = upsertTextField(form, ann.name)
+      f.addToPage(page, { x, y, width, height })
+      if (ann.value) f.setText(ann.value)
+      if (ann.readonly) f.enableReadOnly()
+      if (ann.required) f.enableRequired()
+    } else if (ann.fieldType === 'checkbox') {
+      const f = upsertCheckBox(form, ann.name)
+      f.addToPage(page, { x, y, width, height })
+      if (ann.value === 'on') f.check()
+      if (ann.readonly) f.enableReadOnly()
+      if (ann.required) f.enableRequired()
+    } else if (ann.fieldType === 'radio') {
+      const group = upsertRadioGroup(form, ann.name)
+      const optionValue = ann.optionValue ?? 'on'
+      group.addOptionToPage(optionValue, page, { x, y, width, height })
+      if (ann.value && ann.value === optionValue) group.select(optionValue)
+      if (ann.readonly) group.enableReadOnly()
+      if (ann.required) group.enableRequired()
+    } else if (ann.fieldType === 'dropdown') {
+      const f = upsertDropdown(form, ann.name)
+      f.setOptions(ann.options ?? [])
+      f.addToPage(page, { x, y, width, height })
+      if (ann.value) f.select(ann.value)
+      if (ann.readonly) f.enableReadOnly()
+      if (ann.required) f.enableRequired()
+    } else if (ann.fieldType === 'listbox') {
+      const f = upsertOptionList(form, ann.name)
+      f.setOptions(ann.options ?? [])
+      f.addToPage(page, { x, y, width, height })
+      if (ann.value) f.select(ann.value)
+      if (ann.readonly) f.enableReadOnly()
+      if (ann.required) f.enableRequired()
+    }
+  } catch {
+    // pdf-lib throws if a field name is already in use as a different kind.
+    // Silently skip — the user can re-name in the designer to fix it.
+  }
+}
+
+// Upsert helpers — pdf-lib throws on duplicate-name create, but its
+// getField(name) returns null if absent. Wrap to "get if exists else create".
+function upsertTextField(form: ReturnType<PDFDocument['getForm']>, name: string): ReturnType<ReturnType<PDFDocument['getForm']>['createTextField']> {
+  const existing = safeGetField(form, name) as Record<string, unknown> | null
+  if (existing && 'setText' in existing) return existing as unknown as ReturnType<ReturnType<PDFDocument['getForm']>['createTextField']>
+  return form.createTextField(name)
+}
+function upsertCheckBox(form: ReturnType<PDFDocument['getForm']>, name: string): ReturnType<ReturnType<PDFDocument['getForm']>['createCheckBox']> {
+  const existing = safeGetField(form, name) as Record<string, unknown> | null
+  if (existing && 'check' in existing) return existing as unknown as ReturnType<ReturnType<PDFDocument['getForm']>['createCheckBox']>
+  return form.createCheckBox(name)
+}
+function upsertRadioGroup(form: ReturnType<PDFDocument['getForm']>, name: string): ReturnType<ReturnType<PDFDocument['getForm']>['createRadioGroup']> {
+  const existing = safeGetField(form, name) as Record<string, unknown> | null
+  if (existing && 'addOptionToPage' in existing) return existing as unknown as ReturnType<ReturnType<PDFDocument['getForm']>['createRadioGroup']>
+  return form.createRadioGroup(name)
+}
+function upsertDropdown(form: ReturnType<PDFDocument['getForm']>, name: string): ReturnType<ReturnType<PDFDocument['getForm']>['createDropdown']> {
+  const existing = safeGetField(form, name) as Record<string, unknown> | null
+  if (existing && 'setOptions' in existing && 'addToPage' in existing && !('isMultiselect' in existing)) {
+    return existing as unknown as ReturnType<ReturnType<PDFDocument['getForm']>['createDropdown']>
+  }
+  return form.createDropdown(name)
+}
+function upsertOptionList(form: ReturnType<PDFDocument['getForm']>, name: string): ReturnType<ReturnType<PDFDocument['getForm']>['createOptionList']> {
+  const existing = safeGetField(form, name) as Record<string, unknown> | null
+  if (existing && 'isMultiselect' in existing) return existing as unknown as ReturnType<ReturnType<PDFDocument['getForm']>['createOptionList']>
+  return form.createOptionList(name)
+}
+
+/** pdf-lib's getField throws when missing; wrap to return null instead. */
+function safeGetField(form: ReturnType<PDFDocument['getForm']>, name: string): unknown {
+  try {
+    return form.getField(name)
+  } catch {
+    return null
   }
 }
 

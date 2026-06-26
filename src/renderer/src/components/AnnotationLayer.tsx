@@ -15,8 +15,11 @@ import {
   MARK_DEFAULT_SIZE,
   MARK_DEFAULT_STROKE,
   ATTACHED_IMAGE_ICON_SIZE,
+  FORM_FIELD_DEFAULTS,
   type Annotation,
   type AttachedImageAnnotation,
+  type FormFieldAnnotation,
+  type FormFieldKind,
   type FreeTextAnnotation,
   type ImageAnnotation,
   type LinkAnnotation,
@@ -37,6 +40,7 @@ import MarkBox from './MarkBox'
 import ImageBox from './ImageBox'
 import AttachedImageBox from './AttachedImageBox'
 import LinkBox from './LinkBox'
+import FormFieldBox from './FormFieldBox'
 import EditableRegion from './EditableRegion'
 import { extractEditableRegions } from '../lib/edit/regions'
 
@@ -67,6 +71,7 @@ export default function AnnotationLayer({ pageNumber, viewport }: Props) {
   const shapeKind = useAnnotationStore((s) => s.shapeKind)
   const strokeWidth = useAnnotationStore((s) => s.strokeWidth)
   const pageAnnotations = useAnnotationStore((s) => s.byPage[pageNumber] ?? EMPTY_ANNOTATIONS)
+  const cropRect = useAnnotationStore((s) => s.cropByPage[pageNumber])
   const selectedId = useAnnotationStore((s) => s.selectedId)
   const addTextAnnotation = useAnnotationStore((s) => s.addTextAnnotation)
   const addNoteAnnotation = useAnnotationStore((s) => s.addNoteAnnotation)
@@ -78,6 +83,7 @@ export default function AnnotationLayer({ pageNumber, viewport }: Props) {
   const addImageAnnotation = useAnnotationStore((s) => s.addImageAnnotation)
   const addAttachedImageAnnotation = useAnnotationStore((s) => s.addAttachedImageAnnotation)
   const addLinkAnnotation = useAnnotationStore((s) => s.addLinkAnnotation)
+  const addFormFieldAnnotation = useAnnotationStore((s) => s.addFormFieldAnnotation)
   const remove = useAnnotationStore((s) => s.remove)
   const select = useAnnotationStore((s) => s.select)
 
@@ -232,6 +238,32 @@ export default function AnnotationLayer({ pageNumber, viewport }: Props) {
       return
     }
 
+    // Form-field placement — single click drops the field at the cursor with
+    // the kind's default footprint. Suppressed while preview is on.
+    if (tool.startsWith('form-')) {
+      const previewing = useAnnotationStore.getState().formPreview
+      if (previewing) return
+      const fieldType = tool.replace('form-', '') as FormFieldKind
+      const def = FORM_FIELD_DEFAULTS[fieldType]
+      const { x: cx, y: cy } = pointCssToPdf(viewport, pt.x, pt.y)
+      const baseName = autoFieldName(useAnnotationStore.getState().byPage, fieldType)
+      addFormFieldAnnotation({
+        pageNumber,
+        x: cx - def.width / 2,
+        y: cy + def.height / 2,
+        width: def.width,
+        height: def.height,
+        fieldType,
+        name: baseName,
+        value: '',
+        options: fieldType === 'dropdown' || fieldType === 'listbox' ? ['Option 1', 'Option 2'] : undefined,
+        required: false,
+        readonly: false,
+        optionValue: fieldType === 'radio' ? 'yes' : undefined
+      })
+      return
+    }
+
     if (tool === 'freetext') {
       const { x, y } = pointCssToPdf(viewport, pt.x, pt.y)
       const width = FREETEXT_DEFAULT_WIDTH_CSS / viewport.scale
@@ -266,11 +298,13 @@ export default function AnnotationLayer({ pageNumber, viewport }: Props) {
         const ds: ShapeDrawing = { kind: 'ink', points: [pt] }
         drawingRef.current = ds
         setDrawing(ds)
-      } else {
+      } else if (shapeKind === 'rectangle' || shapeKind === 'oval' || shapeKind === 'line') {
         const ds: ShapeDrawing = { kind: 'shape', shape: shapeKind, start: pt, current: pt }
         drawingRef.current = ds
         setDrawing(ds)
       }
+      // 'redact' as a Shapes-dropdown selection isn't user-facing; the Protect
+      // tool sets `tool === 'redact'` directly, which is handled below.
       e.currentTarget.setPointerCapture(e.pointerId)
       return
     }
@@ -286,8 +320,18 @@ export default function AnnotationLayer({ pageNumber, viewport }: Props) {
       return
     }
 
-    if (isTextMarkupTool || tool === 'link') {
-      // Link reuses the text-markup drag-rect plumbing; commit branches on tool below.
+    // Redact — drag a rectangle that gets saved as a solid black rect.
+    if (tool === 'redact') {
+      const ds: ShapeDrawing = { kind: 'shape', shape: 'rectangle', start: pt, current: pt }
+      drawingRef.current = ds
+      setDrawing(ds)
+      e.currentTarget.setPointerCapture(e.pointerId)
+      return
+    }
+
+    if (isTextMarkupTool || tool === 'link' || tool === 'crop') {
+      // Link and Crop reuse the text-markup drag-rect plumbing; commit
+      // branches on tool below.
       dragStartRef.current = pt
       setDragRect({ left: pt.x, top: pt.y, width: 0, height: 0 })
       e.currentTarget.setPointerCapture(e.pointerId)
@@ -341,6 +385,30 @@ export default function AnnotationLayer({ pageNumber, viewport }: Props) {
       }
       const endPt = localPoint(e)
       if (!endPt) return
+
+      // Crop tool commits a literal rectangle as the page's cropBox.
+      if (tool === 'crop') {
+        const minX = Math.min(start.x, endPt.x)
+        const minY = Math.min(start.y, endPt.y)
+        const maxX = Math.max(start.x, endPt.x)
+        const maxY = Math.max(start.y, endPt.y)
+        if (maxX - minX < 6 || maxY - minY < 6) return
+        // PDF crop boxes use the y-grows-up coordinate system; convert each
+        // corner separately, then derive a normalized rect.
+        const tl = pointCssToPdf(viewport, minX, minY)
+        const br = pointCssToPdf(viewport, maxX, maxY)
+        const pdfX = Math.min(tl.x, br.x)
+        const pdfY = Math.min(tl.y, br.y)
+        const pdfW = Math.abs(br.x - tl.x)
+        const pdfH = Math.abs(tl.y - br.y)
+        useAnnotationStore.getState().setCropForPage(pageNumber, {
+          x: pdfX,
+          y: pdfY,
+          width: pdfW,
+          height: pdfH
+        })
+        return
+      }
 
       // Link tool commits a literal rectangle, then prompts for a URL.
       if (tool === 'link') {
@@ -418,14 +486,18 @@ export default function AnnotationLayer({ pageNumber, viewport }: Props) {
       }
       const p1 = pointCssToPdf(viewport, s.x, s.y)
       const p2 = pointCssToPdf(viewport, c.x, c.y)
+      // Redact piggybacks on the rectangle drawing flow; commit it with its own
+      // shape kind so save/render fill it solid black instead of drawing a border.
+      const finalShape = tool === 'redact' ? 'redact' : shape
+      const finalColor = tool === 'redact' ? '#000000' : color
       addShapeAnnotation({
-        shape,
+        shape: finalShape,
         pageNumber,
         x1: p1.x,
         y1: p1.y,
         x2: p2.x,
         y2: p2.y,
-        color,
+        color: finalColor,
         strokeWidth: SHAPE_STROKE_WIDTH
       })
     }
@@ -465,6 +537,7 @@ export default function AnnotationLayer({ pageNumber, viewport }: Props) {
     (a): a is AttachedImageAnnotation => a.kind === 'attached-image'
   )
   const links = pageAnnotations.filter((a): a is LinkAnnotation => a.kind === 'link')
+  const formFields = pageAnnotations.filter((a): a is FormFieldAnnotation => a.kind === 'form-field')
 
   const cursor = (() => {
     switch (tool) {
@@ -492,6 +565,15 @@ export default function AnnotationLayer({ pageNumber, viewport }: Props) {
         return 'crosshair'
       case 'edit-content':
         return 'default'
+      case 'form-text':
+      case 'form-checkbox':
+      case 'form-radio':
+      case 'form-dropdown':
+      case 'form-listbox':
+        return 'crosshair'
+      case 'crop':
+      case 'redact':
+        return 'crosshair'
       default:
         return 'default'
     }
@@ -661,6 +743,18 @@ export default function AnnotationLayer({ pageNumber, viewport }: Props) {
         ))}
       </div>
 
+      {/* Form fields (design or preview mode) */}
+      <div className="absolute inset-0 pointer-events-none">
+        {formFields.map((f) => (
+          <FormFieldBox key={f.id} field={f} viewport={viewport} containerRef={containerRef} />
+        ))}
+      </div>
+
+      {/* Crop preview — fades the area outside the crop rectangle. */}
+      {cropRect && (
+        <CropPreview rect={cropRect} viewport={viewport} pageNumber={pageNumber} />
+      )}
+
       {/* Sticky notes */}
       <div className="absolute inset-0 pointer-events-none">
         {notes.map((n) => (
@@ -681,6 +775,63 @@ export default function AnnotationLayer({ pageNumber, viewport }: Props) {
 }
 
 /** Format `YYYY-MM-DD HH:MM` for the "Stamp with date and time" toggle. */
+/** Crop visualization: dims the area outside the saved crop rectangle and
+ *  shows a small "Clear crop" affordance in its top-right. */
+function CropPreview({
+  rect,
+  viewport,
+  pageNumber
+}: {
+  rect: { x: number; y: number; width: number; height: number }
+  viewport: import('pdfjs-dist').PageViewport
+  pageNumber: number
+}): JSX.Element {
+  const tl = pointPdfToCss(viewport, rect.x, rect.y + rect.height)
+  const widthCss = rect.width * viewport.scale
+  const heightCss = rect.height * viewport.scale
+  return (
+    <>
+      {/* Four overlay strips dim everything outside the rect. */}
+      <div className="absolute inset-0 pointer-events-none" style={{ background: 'rgba(15, 23, 42, 0.35)', clipPath: `polygon(0 0, 100% 0, 100% 100%, 0 100%, 0 ${tl.top}px, ${tl.left}px ${tl.top}px, ${tl.left}px ${tl.top + heightCss}px, ${tl.left + widthCss}px ${tl.top + heightCss}px, ${tl.left + widthCss}px ${tl.top}px, 0 ${tl.top}px)` }} />
+      <div
+        className="absolute pointer-events-none border-2 border-blue-500"
+        style={{ left: tl.left, top: tl.top, width: widthCss, height: heightCss }}
+      />
+      <button
+        onClick={(e) => {
+          e.stopPropagation()
+          useAnnotationStore.getState().setCropForPage(pageNumber, null)
+        }}
+        title="Clear crop on this page"
+        className="absolute h-6 px-2 text-[11px] rounded bg-blue-500 text-white shadow pointer-events-auto"
+        style={{ left: tl.left + widthCss - 80, top: Math.max(2, tl.top - 28) }}
+      >
+        Clear crop
+      </button>
+    </>
+  )
+}
+
+/** Generate a unique-ish field name like `text1`, `text2`, scanning every page
+ *  for existing FormFieldAnnotations of the same kind. Radio groups intentionally
+ *  share names within the same kind so users can co-locate them by hand. */
+function autoFieldName(byPage: Record<number, Annotation[]>, kind: FormFieldKind): string {
+  const prefix = kind === 'checkbox' ? 'check' : kind === 'radio' ? 'radio' : kind
+  let max = 0
+  const re = new RegExp(`^${prefix}(\\d+)$`)
+  for (const arr of Object.values(byPage)) {
+    for (const a of arr) {
+      if (a.kind !== 'form-field' || a.fieldType !== kind) continue
+      const m = re.exec(a.name)
+      if (m) {
+        const n = Number(m[1])
+        if (n > max) max = n
+      }
+    }
+  }
+  return `${prefix}${max + 1}`
+}
+
 function formatStampDateTime(d: Date): string {
   const pad = (n: number): string => String(n).padStart(2, '0')
   return (
@@ -795,6 +946,39 @@ function ShapeElement({
           />
         )}
         <rect x={x} y={y} width={w} height={h} {...commonProps} />
+      </g>
+    )
+  }
+
+  // Redact — opaque black fill, no border. Behavior matches save: the saved
+  // PDF gets a solid black rectangle over the content.
+  if (shape.shape === 'redact') {
+    return (
+      <g>
+        {isSelected && (
+          <rect
+            x={x - 2}
+            y={y - 2}
+            width={w + 4}
+            height={h + 4}
+            fill="none"
+            stroke="#3b82f6"
+            strokeWidth={1}
+            strokeDasharray="4 3"
+            pointerEvents="none"
+          />
+        )}
+        <rect
+          x={x}
+          y={y}
+          width={w}
+          height={h}
+          fill="#000000"
+          stroke="none"
+          style={{ pointerEvents: 'visiblePainted', cursor: 'pointer' }}
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => { e.stopPropagation(); onSelect() }}
+        />
       </g>
     )
   }

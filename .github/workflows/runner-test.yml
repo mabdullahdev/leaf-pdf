@@ -1,0 +1,11 @@
+name: Runner Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - run: echo "runner assigned ok"

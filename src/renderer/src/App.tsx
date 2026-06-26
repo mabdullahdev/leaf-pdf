@@ -3,6 +3,7 @@ import Toolbar from './components/Toolbar'
 import AnnotationToolbar from './components/AnnotationToolbar'
 import Sidebar from './components/Sidebar'
 import PdfViewer from './components/PdfViewer'
+import PagesGrid from './components/PagesGrid'
 import ViewModeBar from './components/ViewModeBar'
 import Library from './components/Library'
 import CloseConfirmDialog from './components/CloseConfirmDialog'
@@ -14,6 +15,7 @@ export default function App() {
   const pdf = useDocumentStore((s) => s.pdf)
   const isDark = useUiStore((s) => s.isDark)
   const sidebarOpen = useUiStore((s) => s.sidebarOpen)
+  const activeTab = useUiStore((s) => s.activeTab)
   const toggleDark = useUiStore((s) => s.toggleDark)
   const loadFromDialog = useDocumentStore((s) => s.loadFromDialog)
   const loadBytes = useDocumentStore((s) => s.loadBytes)
@@ -132,8 +134,8 @@ export default function App() {
       <AnnotationToolbar />
       <div className="flex-1 flex overflow-hidden relative">
         {sidebarOpen && <Sidebar />}
-        <PdfViewer />
-        <ViewModeBar />
+        {activeTab === 'pages' ? <PagesGrid /> : <PdfViewer />}
+        {activeTab !== 'pages' && <ViewModeBar />}
       </div>
       {(loading || saving || converting) && (
         <div className="absolute inset-x-0 top-12 flex justify-center pointer-events-none">
