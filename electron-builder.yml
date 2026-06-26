@@ -1,5 +1,5 @@
 appId: com.pdfgear.app
-productName: PDFgear
+productName: leaf-pdf
 directories:
   buildResources: resources
   output: dist
